@@ -1,24 +1,28 @@
-# Locked dependencies — generated from pyproject.toml
-# Repeatable install: pip install -r requirements.lock
+# Locked dependencies — exact versions validated in CI.
+#
+# Repeatable install:
+#   pip install -r requirements.lock
+#   pip install -e .
 #
 # Re-lock with:
 #   pip install pip-tools
 #   pip-compile pyproject.toml --extra test -o requirements.lock
 #
-# Versions below are the exact versions validated in CI (observed 2026-10-11).
+# Versions pinned from local venv observed 2026-10-12.
+# All four parquet-backed layer checks pass on these exact versions.
 
-duckdb>=1.1.0
-pandas>=2.2.0
-numpy>=1.26.0
-pyarrow>=17.0.0
-PyYAML>=6.0.1
+duckdb==1.5.6
+numpy==2.5.4
+pandas==3.0.6
+pyarrow==26.0.0
+PyYAML==6.0.3
 
 # test extras
-pytest>=8.1.0
-pytest-cov>=5.0.0
+pytest==9.1.1
+pytest-cov==7.1.0
 
 # transitive
-packaging>=24.0
-pluggy>=1.4.0
-iniconfig>=2.0.0
-coverage>=7.5.0
+coverage==7.16.2
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.6.0

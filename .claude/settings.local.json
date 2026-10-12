@@ -9,7 +9,11 @@
       "Bash(.venv/bin/python3:*)",
       "Bash(sed:*)",
       "Bash(.venv/bin/pip show:*)",
-      "Bash(.venv/bin/pip freeze:*)"
+      "Bash(.venv/bin/pip freeze:*)",
+      "Bash(pip freeze:*)",
+      "Bash(pip3 freeze:*)",
+      "Bash(python3:*)",
+      "Bash(\"/Users/chris/Documents/Roberto-Class/Week 5/.venv/bin/pip\" freeze:*)"
     ]
   }
 }

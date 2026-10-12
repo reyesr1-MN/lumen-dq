@@ -1,28 +1,58 @@
+# ============================================================
+# Quality Gate — four independently named required checks.
+#
+# Trigger: pull_request targeting main, merge_group.
+# Each job name is a stable required-status-check context;
+# configure branch protection to require all four.
+#
+# Security model
+# --------------
+# • pull_request (NOT pull_request_target): PR code executes with
+#   read-only GITHUB_TOKEN; no secrets are exposed to PR branches.
+# • No continue-on-error, no || true, no skipped required checks.
+# • fetch-depth: 0 only in the job that needs commit history.
+#
+# Required check names (register these in branch protection):
+#   validate-contract-structure
+#   generate-and-test
+#   validate-data
+#   contract-compatibility
+# ============================================================
+
 name: Quality Gate
 
-# Runs on every push and on every pull request targeting main.
-# The job must pass before a merge is allowed (enforce via branch protection).
-
 on:
-  push:
-    branches: ["**"]
   pull_request:
     branches: [main]
+  merge_group:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # Synthetic freshness clock — matches recorded ingested_at range in
+  # the deterministic baseline (seed=42, as-of=2024-01-30).
+  # CI output is labelled SYNTHETIC FRESHNESS TEST; this does NOT prove
+  # that the live core-banking pipeline meets its 24-hour SLA.
+  VALIDATION_CLOCK: "2024-01-30T12:00:00Z"
+
+# ── Job 1: contract structure ─────────────────────────────────────────────────
 
 jobs:
-  quality-gate:
-    name: DQ checks + tests
-    runs-on: ubuntu-latest
+  validate-contract-structure:
+    name: validate-contract-structure
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: "3.12"
+          cache: pip
 
       - name: Install locked dependencies
         run: |
@@ -30,33 +60,160 @@ jobs:
           pip install -r requirements.lock
           pip install -e .
 
-      # ── Data generation ─────────────────────────────────────────────────────
-      # generate CLI writes to {output-dir}/baseline/ so pass the parent "data"
-      - name: Generate baseline data (seed=42, deterministic)
-        run: python -m lumen_dq.generate --output-dir data
+      - name: Generate synthetic baseline (seed=42, as-of=2024-01-30)
+        run: lumen-generate --output-dir data
 
-      # ── Layer 1-4 DQ checks ─────────────────────────────────────────────────
-      - name: Run layered DQ checks (must pass)
-        run: python -m lumen_dq.run_checks --data-dir data/baseline --strict
-
-      # ── YAML contract validation ────────────────────────────────────────────
-      - name: Validate accounts data contract
+      - name: Validate accounts contract structure
+        # Exits 0 = all rules pass, 1 = data violation, 2 = schema/config error.
+        # --now pins the validation clock for deterministic freshness testing.
+        # stderr will contain: SYNTHETIC FRESHNESS TEST — not proof of
+        # source-system timeliness.
         run: |
-          python -m lumen_dq.validate_contract contracts/accounts.yml \
-            --data-dir data/baseline
+          mkdir -p evidence
+          python scripts/validate_contract.py contracts/accounts.yaml \
+            --data-dir data/baseline \
+            --now "$VALIDATION_CLOCK" \
+            > evidence/contract_structure.txt 2>&1
+          cat evidence/contract_structure.txt
 
-      # ── Pytest suite ────────────────────────────────────────────────────────
-      - name: Run pytest
-        run: |
-          pytest tests/ -v --tb=short \
-            --junitxml=evidence/junit.xml \
-            --cov=lumen_dq --cov-report=term-missing
-
-      # ── Evidence upload ─────────────────────────────────────────────────────
-      - name: Upload evidence artifacts
+      - name: Upload contract evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dq-evidence-${{ github.run_id }}
+          name: contract-structure-${{ github.run_id }}-${{ github.run_attempt }}
           path: evidence/
-          retention-days: 90
+          retention-days: 30
+
+# ── Job 2: data generation + full test suite ──────────────────────────────────
+
+  generate-and-test:
+    name: generate-and-test
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install locked dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install -e .
+
+      - name: Generate synthetic baseline (seed=42, as-of=2024-01-30)
+        run: lumen-generate --output-dir data
+
+      - name: Run layered test suite (including rejection tests)
+        # Failure propagates: no continue-on-error, no || true.
+        run: |
+          mkdir -p evidence
+          pytest tests/ -v --tb=short \
+            --junitxml=evidence/junit.xml \
+            --cov=lumen_dq \
+            --cov-report=term-missing \
+            --cov-report=xml:evidence/coverage.xml
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          retention-days: 30
+
+# ── Job 3: data-quality CLI validation ───────────────────────────────────────
+
+  validate-data:
+    name: validate-data
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install locked dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install -e .
+
+      - name: Generate synthetic baseline (seed=42, as-of=2024-01-30)
+        run: lumen-generate --output-dir data
+
+      - name: Run layered DQ validator (exit 1 on BLOCKING failures)
+        # lumen-validate: layers 1-5, JSON output for downstream consumption.
+        # lumen-checks: legacy cross-table checks, --strict ensures exit 1.
+        # Both must pass; no || true.
+        run: |
+          mkdir -p evidence
+          lumen-validate data/baseline --out evidence/dq_results.json
+          lumen-checks --data-dir data/baseline --strict
+
+      - name: Upload DQ results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dq-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          retention-days: 30
+
+# ── Job 4: breaking-change gate ───────────────────────────────────────────────
+
+  contract-compatibility:
+    name: contract-compatibility
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout (full history required for --check-breaking)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install locked dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install -e .
+
+      - name: Fetch main branch for comparison baseline
+        run: git fetch origin main
+
+      - name: Check for breaking contract changes against origin/main
+        # Exits 0 = no breaking changes (or breaking changes with correct major
+        #           version bump and documented migration plan).
+        # Exits 1 = breaking changes detected without required major version bump.
+        # Exits 2 = config / schema error.
+        # A breaking change committed alongside a version bump but WITHOUT a
+        # migration plan is still rejected by this gate.
+        run: |
+          mkdir -p evidence
+          python scripts/validate_contract.py contracts/accounts.yaml \
+            --check-breaking --base origin/main \
+            > evidence/breaking_change_check.txt 2>&1
+          cat evidence/breaking_change_check.txt
+
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          retention-days: 30

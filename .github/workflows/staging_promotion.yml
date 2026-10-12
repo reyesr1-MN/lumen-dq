@@ -1,29 +1,57 @@
-name: Staging Promotion
-
-# Runs only on pushes to main (after the quality gate has passed).
-# Promotes validated baseline data and evidence to a "staging" artifact.
+# ============================================================
+# Staging Promotion — push-to-main only.
 #
-# In a real pipeline this job would write to a staging schema or object store.
-# Here it archives the parquet files + evidence to a named workflow artifact.
+# Re-runs the full validation suite on the exact merged commit,
+# builds a versioned artifact with checksums and a manifest, then
+# records a deployment against the GitHub "staging" environment.
+#
+# ARTIFACT-ONLY DEMO
+# ------------------
+# No persistent staging server is configured for this demo project.
+# The "staging" GitHub environment records the deployment identity
+# (commit SHA, artifact name, contract version, validation results)
+# and retains the artifact for 90 days.  This is NOT equivalent to
+# deploying data to a live staging schema or object store.
+# Before promoting to a real production pipeline, replace the
+# "Upload staging artifact" step with a write to the actual target
+# (S3 bucket, GCS, BigQuery staging dataset, etc.).
+#
+# Rollback: see .github/workflows/rollback.yml and scripts/rollback.md.
+# ============================================================
+
+name: Staging Promotion
 
 on:
   push:
     branches: [main]
 
+# Promotion requires re-running validation; read-only for that phase.
+# deployments: write is needed to record the deployment status.
+permissions:
+  contents: read
+  deployments: write
+
+env:
+  VALIDATION_CLOCK: "2024-01-30T12:00:00Z"
+
 jobs:
-  promote-to-staging:
-    name: Promote validated data to staging
-    runs-on: ubuntu-latest
+  # ── Phase 1: re-validate exact merged commit ───────────────────────────────
+  validate:
+    name: validate-merged-commit
+    runs-on: ubuntu-22.04
+
+    outputs:
+      contract_version: ${{ steps.contract_ver.outputs.version }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: "pip"
+          python-version: "3.12"
+          cache: pip
 
       - name: Install locked dependencies
         run: |
@@ -31,33 +59,133 @@ jobs:
           pip install -r requirements.lock
           pip install -e .
 
-      # ── Re-run the full quality gate ────────────────────────────────────────
-      # (Promotion must not rely solely on the PR gate passing;
-      #  re-run here to guarantee the artifact that is promoted is clean.)
-      - name: Generate baseline data
-        run: python -m lumen_dq.generate --output-dir data
+      - name: Generate synthetic baseline (seed=42, as-of=2024-01-30)
+        run: lumen-generate --output-dir data
 
-      - name: DQ checks (strict)
-        run: python -m lumen_dq.run_checks --data-dir data/baseline --strict
-
-      - name: Validate accounts contract
+      - name: Run layered DQ validator
         run: |
-          python -m lumen_dq.validate_contract contracts/accounts.yml \
-            --data-dir data/baseline
+          mkdir -p evidence
+          lumen-validate data/baseline --out evidence/dq_results.json
+          lumen-checks --data-dir data/baseline --strict
 
-      - name: Run pytest
-        run: pytest tests/ -v --tb=short --junitxml=evidence/junit.xml
+      - name: Validate accounts contract (SYNTHETIC FRESHNESS TEST)
+        run: |
+          python scripts/validate_contract.py contracts/accounts.yaml \
+            --data-dir data/baseline \
+            --now "$VALIDATION_CLOCK" \
+            > evidence/contract_validation.txt 2>&1
+          cat evidence/contract_validation.txt
 
-      # ── Record promotion evidence ───────────────────────────────────────────
+      - name: Run full test suite
+        run: |
+          pytest tests/ -v --tb=short \
+            --junitxml=evidence/junit.xml \
+            --cov=lumen_dq --cov-report=xml:evidence/coverage.xml
+
+      - name: Extract contract version
+        id: contract_ver
+        run: |
+          python - <<'EOF'
+          import yaml, os
+          with open("contracts/accounts.yaml") as f:
+              c = yaml.safe_load(f)
+          ver = c.get("version", "unknown")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={ver}\n")
+          print(f"Contract version: {ver}")
+          EOF
+
+  # ── Phase 2: build artifact + promote to staging ──────────────────────────
+  build-and-promote:
+    name: build-and-promote
+    needs: validate
+    runs-on: ubuntu-22.04
+    environment: staging    # GitHub environment — records deployment history
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install locked dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install -e .
+
+      - name: Generate synthetic baseline
+        run: lumen-generate --output-dir data
+
+      - name: Re-run DQ validator (promotion gate)
+        # Promotion must not proceed if validation fails.
+        # This re-run on the build runner guarantees the artifact
+        # that is packaged is the one that was validated.
+        run: |
+          mkdir -p evidence
+          lumen-validate data/baseline --out evidence/dq_results.json
+          lumen-checks --data-dir data/baseline --strict
+
+      - name: Build versioned artifact (checksums + manifest)
+        run: |
+          python scripts/build_artifact.py \
+            --data-dir data/baseline \
+            --dq-results evidence/dq_results.json \
+            --contract contracts/accounts.yaml \
+            --output-dir artifact \
+            --sha "$GITHUB_SHA" \
+            --contract-version "${{ needs.validate.outputs.contract_version }}"
+
+      - name: Run staging smoke test
+        run: python scripts/smoke_test.py --artifact-dir artifact
+
       - name: Record promotion evidence
         run: python scripts/record_evidence.py
 
-      # ── Upload staging artifact ─────────────────────────────────────────────
       - name: Upload staging artifact
+        # ── ARTIFACT-ONLY DEMO ──
+        # No live staging server.  This artifact IS the staging record.
+        # Name includes commit SHA so every promotion is immutable and
+        # addressable; use this name in the rollback workflow input.
         uses: actions/upload-artifact@v4
         with:
           name: staging-${{ github.sha }}
           path: |
-            data/baseline/
+            artifact/
             evidence/
           retention-days: 90
+
+      - name: Create GitHub deployment record
+        # Records deployment identity in the "staging" environment.
+        # Does NOT deploy to any server — see ARTIFACT-ONLY DEMO note above.
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const sha = context.sha;
+            const contractVersion = '${{ needs.validate.outputs.contract_version }}';
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: sha,
+              environment: 'staging',
+              description: `Contract v${contractVersion} — artifact staging-${sha}`,
+              auto_merge: false,
+              required_contexts: [],
+              transient_environment: false,
+              production_environment: false,
+            });
+            console.log(`Deployment ID: ${deployment.data.id}`);
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: deployment.data.id,
+              state: 'success',
+              description: `Validated artifact staging-${sha} (ARTIFACT-ONLY DEMO — no live target)`,
+              log_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+            console.log('Deployment status recorded: success');
