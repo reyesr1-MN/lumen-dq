@@ -1,0 +1,25 @@
+# Generated data — reproducible via `make generate`
+data/baseline/
+data/staging/
+
+# Evidence logs (kept locally, not committed)
+evidence/demo_*.txt
+evidence/evidence_*.json
+evidence/junit.xml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db

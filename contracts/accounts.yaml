@@ -1,0 +1,399 @@
+# ============================================================
+# Contract format: lumen-dq-contract v1
+#
+# CUSTOM FORMAT — not compatible with any external standard
+# (not Great Expectations, dbt contracts, OpenAPI, or similar).
+#
+# Executable validator:
+#   python scripts/validate_contract.py contracts/accounts.yaml \
+#       --data-dir data/baseline
+#
+# Deterministic / CI run (synthetic freshness testing only):
+#   python scripts/validate_contract.py contracts/accounts.yaml \
+#       --data-dir data/baseline --now 2024-01-30T12:00:00Z
+#
+# Breaking-change gate (run in PR pipeline against base branch):
+#   python scripts/validate_contract.py contracts/accounts.yaml \
+#       --check-breaking --base origin/main
+#
+# Version history
+#   2.0.0  2024-01-30  Full contract with freshness, lifecycle,
+#                      identifier constraints, and migration policy.
+#   1.1.0  2024-01-30  (accounts.yml) Updated schema v2 with product_type,
+#                      account_status, currency, closed_date, ingested_at.
+#   1.0.0  2024-01-30  (accounts.yml) Initial contract (post-incident).
+# ============================================================
+
+contract_format: lumen-dq-contract
+format_version: "1"
+
+# ── Contract identity ─────────────────────────────────────────────────────────
+
+name: accounts
+version: "2.0.0"
+status: active        # active | deprecated | draft
+
+description: >
+  One row per account_id in the core-banking accounts ledger.
+  Each account belongs to exactly one customer and exactly one branch.
+  Grain must be enforced before any downstream join; duplicate account_ids
+  would fan out balance data and overstate customer-level metrics.
+
+# ── Producer and consumer ────────────────────────────────────────────────────
+#
+# contact_role and escalation_role are job-function labels, not named people.
+# Look up current role holders in the team directory.
+
+producer:
+  name: core-banking-ingestion
+  system: core-banking
+  contact_role: data-engineering-oncall
+  escalation_role: data-engineering-lead
+  description: >
+    Extracts accounts from the core-banking ledger and writes a full daily
+    snapshot to the data lake as Parquet.  Sets ingested_at to the UTC
+    timestamp of the extraction run.
+
+consumer:
+  name: deposits-reporting
+  system: deposits-reporting
+  contact_role: analytics-oncall
+  escalation_role: analytics-lead
+  description: >
+    Joins accounts to daily_balances and branch_reference to produce the
+    daily deposits report.  Depends on account_id grain uniqueness to
+    prevent JOIN fan-out.
+
+# ── Ownership ─────────────────────────────────────────────────────────────────
+
+ownership:
+  steward_role: data-engineering-lead
+  domain: deposits
+  review_frequency: quarterly
+  change_approval: >
+    Breaking changes require written sign-off from both producer
+    (escalation_role) and consumer (escalation_role) before deployment.
+    Additive changes require producer sign-off only.
+
+# ── Table, grain and primary key ─────────────────────────────────────────────
+
+table: accounts
+
+grain:
+  columns:
+    - account_id
+  description: >
+    One row per account_id.  No duplicates permitted.  Checked before any
+    downstream join; violation blocks the pipeline.
+
+primary_key:
+  columns:
+    - account_id
+
+# ── Column catalogue ──────────────────────────────────────────────────────────
+#
+# logical_type  : business-level type classification (informational)
+# physical_type : DuckDB type as reported for the parquet column
+# nullable      : false = NOT NULL enforced; true = NULL permitted
+# constraints   : machine-checked rules (all keys must be supported by the
+#                 validator; unknown keys cause exit 2)
+
+columns:
+
+  - name: account_id
+    logical_type: identifier
+    physical_type: VARCHAR
+    nullable: false
+    description: >
+      Surrogate primary key.  Format: ACCT-{4-or-more-digit zero-padded
+      integer}.  Example: ACCT-0001.  Assigned at account creation; never
+      reused.
+    constraints:
+      pattern: "^ACCT-[0-9]{4,}$"
+
+  - name: customer_id
+    logical_type: identifier
+    physical_type: VARCHAR
+    nullable: false
+    description: >
+      Foreign key to customers.customer_id.  Every account must belong to
+      exactly one customer.  Format: CUST-{4-or-more-digit zero-padded
+      integer}.  Example: CUST-0001.
+    constraints:
+      pattern: "^CUST-[0-9]{4,}$"
+
+  - name: branch_id
+    logical_type: integer
+    physical_type: BIGINT
+    nullable: false
+    description: >
+      Foreign key to branch_reference.branch_id.  Every account must be
+      assigned to exactly one branch.  Integer ≥ 1.  Stored as BIGINT
+      (int64) in parquet.
+    constraints:
+      min: 1
+
+  - name: product_type
+    logical_type: enum
+    physical_type: VARCHAR
+    nullable: false
+    description: >
+      Product category for this account.  New product types require a
+      contract additive change (minor version bump) and producer notification
+      to consumers before appearing in data.
+    allowed_values:
+      - CHECKING
+      - SAVINGS
+      - CD
+      - MONEY_MARKET
+
+  - name: account_status
+    logical_type: enum
+    physical_type: VARCHAR
+    nullable: false
+    description: >
+      Current lifecycle status of the account.  Drives closed_date rules;
+      see lifecycle_constraints.closed_date_rules.
+    allowed_values:
+      - ACTIVE
+      - FROZEN
+      - CLOSED
+
+  - name: currency
+    logical_type: enum
+    physical_type: VARCHAR
+    nullable: false
+    description: >
+      ISO-4217 currency code.  Lumen Community Bank operates in USD only.
+      This allowed_values list is intentionally restrictive; adding a new
+      currency is a breaking change (narrowing in reverse = expanding is
+      non-breaking, but changing to multi-currency changes consumer logic).
+    allowed_values:
+      - USD
+
+  - name: opened_date
+    logical_type: date
+    physical_type: VARCHAR
+    nullable: false
+    description: >
+      Calendar date the account was opened.  Stored as an ISO-8601 string
+      (YYYY-MM-DD) in parquet because pandas serialises datetime.date as
+      strings.  Must be parseable as a valid date; must not be in the future
+      relative to the validation clock.
+    constraints:
+      date_format: "YYYY-MM-DD"
+      min_date: "2000-01-01"
+      max_date_offset_days: 0    # must not be in the future
+
+  - name: closed_date
+    logical_type: date
+    physical_type: VARCHAR
+    nullable: true
+    description: >
+      Calendar date the account was closed.  NULL when account_status is
+      ACTIVE or FROZEN.  Non-NULL only when account_status = CLOSED.
+      Must be strictly after opened_date when populated.
+      Stored as ISO-8601 string in parquet (same as opened_date).
+    constraints:
+      date_format: "YYYY-MM-DD"
+      lifecycle_rule: closed_date_rules
+
+  - name: ingested_at
+    logical_type: timestamp_utc
+    physical_type: TIMESTAMP
+    nullable: false
+    description: >
+      UTC timestamp when this accounts snapshot was ingested by the
+      core-banking pipeline.  This is the sole freshness signal.
+      Do NOT measure freshness from opened_date, closed_date, or filesystem
+      modification time.  The validator must never adjust or refresh
+      timestamps to make stale data appear fresh.
+
+# ── Foreign keys ──────────────────────────────────────────────────────────────
+
+foreign_keys:
+
+  - column: customer_id
+    references:
+      table: customers
+      column: customer_id
+    severity: BLOCKING
+    description: >
+      Every account must reference a known customer.  Orphaned accounts
+      (customer_id not in customers) are excluded from customer-level reports,
+      silently understating customer balances.
+
+  - column: branch_id
+    references:
+      table: branch_reference
+      column: branch_id
+    severity: BLOCKING
+    description: >
+      Every account must reference a known branch.  Orphaned accounts are
+      excluded from branch-level reports.  Duplicate branch_ids in
+      branch_reference cause JOIN fan-out; that is a grain violation on the
+      reference table, not a FK violation here.
+
+# ── Lifecycle constraints ─────────────────────────────────────────────────────
+#
+# Multi-column business rules that cannot be expressed as per-column
+# constraints.  Referenced from column constraints via lifecycle_rule key.
+
+lifecycle_constraints:
+
+  closed_date_rules:
+    description: >
+      closed_date integrity rules derived from account lifecycle state.
+      All three checks are BLOCKING.
+    checks:
+
+      - name: closed_date_null_for_non_closed
+        description: >
+          Non-CLOSED accounts must not have a closed_date.  A non-null
+          closed_date on an ACTIVE or FROZEN account indicates a pipeline
+          error (premature closure or status not updated).
+        sql_condition: "account_status != 'CLOSED' AND closed_date IS NOT NULL"
+        expected_violations: 0
+        severity: BLOCKING
+
+      - name: closed_date_required_for_closed
+        description: >
+          CLOSED accounts must have a closed_date.  A null closed_date on a
+          CLOSED account means the closure date is unknown, making temporal
+          analysis impossible.
+        sql_condition: "account_status = 'CLOSED' AND closed_date IS NULL"
+        expected_violations: 0
+        severity: BLOCKING
+
+      - name: closed_date_after_opened_date
+        description: >
+          closed_date must be strictly after opened_date.  A closed_date on
+          or before opened_date indicates a data entry error.
+        sql_condition: >
+          closed_date IS NOT NULL
+          AND TRY_CAST(closed_date AS DATE) <= TRY_CAST(opened_date AS DATE)
+        expected_violations: 0
+        severity: BLOCKING
+
+# ── Row count bounds ──────────────────────────────────────────────────────────
+
+row_counts:
+  min: 1
+  max: 100000
+
+# ── Freshness SLA ─────────────────────────────────────────────────────────────
+#
+# DEMONSTRATION SLA.  The 24-hour value is illustrative for classroom use
+# and does not represent a commitment from a real production system.
+
+freshness:
+  _note: >
+    DEMONSTRATION SLA — 24 hours.  This value is set for illustration and
+    classroom use.  Replace with the agreed operational SLA before promoting
+    this contract to a production pipeline.
+
+  measurement:
+    source_column: ingested_at
+    source_table: accounts
+    _note: >
+      Freshness is measured exclusively from the producer-supplied
+      ingested_at column.  Do NOT use opened_date, balance_date, or
+      filesystem modification time as a freshness proxy.  The validator
+      must never adjust, clamp, or refresh timestamps to make stale data
+      pass the check.
+
+  sla_hours: 24
+
+  snapshot_mode: full
+  _snapshot_mode_note: >
+    In full-snapshot mode every row in the snapshot must satisfy the SLA.
+    A single row older than sla_hours causes the entire freshness check to
+    fail.  This prevents a partial re-load from masking a stale majority.
+
+  reject_future_minutes: 5
+  _reject_future_note: >
+    Any ingested_at timestamp more than reject_future_minutes ahead of the
+    validation clock is rejected as clock-skew or pipeline misconfiguration.
+    Future timestamps indicate the producer's clock is wrong or the file
+    arrived before it was supposed to be generated.
+
+  reject_empty_snapshot: true
+  _reject_empty_note: >
+    A snapshot with zero rows is always rejected regardless of timestamps.
+    An empty snapshot could silently replace valid data with nothing.
+
+  _now_argument_note: >
+    Pass --now <ISO-8601 UTC> to pin the validation clock.  Omit for
+    operational validation, which defaults to actual UTC time.  Using --now
+    in CI with a recorded timestamp is explicitly labeled as SYNTHETIC
+    FRESHNESS TESTING (see ci_synthetic_note).
+
+  _ci_synthetic_note: >
+    CI may generate a synthetic accounts snapshot using a single recorded
+    run timestamp and pass --now matching that timestamp.  This exercises
+    contract structure and data rule validation only.  It does not prove
+    that the real core-banking ingestion pipeline meets its freshness SLA.
+    CI output must be labeled: "SYNTHETIC FRESHNESS TEST — not proof of
+    source-system timeliness."
+
+# ── Breaking-change policy ────────────────────────────────────────────────────
+
+breaking_changes:
+  _definition: >
+    A breaking change is any modification that requires consumers to update
+    their pipelines, queries, or data expectations.
+
+  requires_major_version_bump:
+    - Removing or renaming a column
+    - Changing physical_type to an incompatible type
+    - "Widening nullability (nullable: false -> nullable: true)"
+    - Changing primary_key or grain columns
+    - Narrowing allowed_values (removing a previously permitted value)
+    - Narrowing an identifier pattern or date range (removing valid values)
+    - "Weakening the freshness SLA (increasing sla_hours)"
+    - Removing a foreign_key guarantee consumers depend on
+
+  non_breaking_changes:
+    - Adding a new nullable column with no allowed_values restriction
+    - Strengthening a constraint (narrowing what producer may produce)
+    - Reducing sla_hours (faster delivery is non-breaking for consumers)
+    - Adding documentation fields
+
+  additive_column_policy: >
+    Adding a new nullable column with no allowed_values restriction is
+    non-breaking (minor version bump: 2.0.0 → 2.1.0).
+    Adding a non-nullable column is breaking: existing snapshots have no
+    value for that column.
+    Adding a column with allowed_values is breaking: consumers must handle
+    the new values.
+    Consumer obligation: SELECT explicit columns rather than SELECT *.
+    A consumer that breaks on an additive column change is violating this
+    contract clause.
+
+  version_bump_policy: >
+    A major version bump alone (e.g., 2.x.x → 3.0.0) does not bypass
+    required peer review or data validation.  The new version must pass all
+    checks in the updated contract before it is promoted to production.
+    A version bump committed alongside a breaking data change without a
+    migration plan is rejected by the --check-breaking gate.
+
+# ── Migration policy ──────────────────────────────────────────────────────────
+
+migration_policy:
+  required_artifacts:
+    - Migration guide documenting every breaking change and its consumer impact
+    - Consumer impact assessment signed off by consumer contact_role
+    - Transition plan with a parallel-run window (minimum one sprint, two weeks)
+    - Updated contract YAML committed to version control before cutover
+    - Passing validate_contract.py run on new schema before cutover
+    - Post-cutover validation run confirming no regressions
+
+  transition_window: >
+    The producer must support the previous major version for a minimum of
+    one sprint (two weeks) after the new version is deployed, unless the
+    consumer explicitly waives this requirement in writing.
+
+  rollback_plan: >
+    The producer must maintain the ability to re-publish the previous major
+    version for the duration of the transition window.  See scripts/rollback.md
+    for the operational procedure.

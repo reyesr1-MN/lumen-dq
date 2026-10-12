@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lumen-dq"
+version = "0.1.0"
+description = "Data-quality demonstration for Lumen Community Bank (42-branch fictional bank)"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.1.0",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "pyarrow>=17.0.0",
+    "pyyaml>=6.0.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.3.0",
+    "pytest-cov>=5.0.0",
+]
+
+[project.scripts]
+lumen-generate  = "lumen_dq.generate:_cli"
+lumen-checks    = "lumen_dq.run_checks:main"
+lumen-contract  = "lumen_dq.validate_contract:main"
+lumen-replay    = "lumen_dq.replay_incident:main"
+lumen-validate  = "lumen_dq.validate:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lumen_dq"]
+
+[tool.pytest.ini_options]
+testpaths    = ["tests"]
+addopts      = "-v --tb=short"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["src/lumen_dq"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true

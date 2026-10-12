@@ -1,0 +1,63 @@
+name: Staging Promotion
+
+# Runs only on pushes to main (after the quality gate has passed).
+# Promotes validated baseline data and evidence to a "staging" artifact.
+#
+# In a real pipeline this job would write to a staging schema or object store.
+# Here it archives the parquet files + evidence to a named workflow artifact.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  promote-to-staging:
+    name: Promote validated data to staging
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install locked dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.lock
+          pip install -e .
+
+      # ── Re-run the full quality gate ────────────────────────────────────────
+      # (Promotion must not rely solely on the PR gate passing;
+      #  re-run here to guarantee the artifact that is promoted is clean.)
+      - name: Generate baseline data
+        run: python -m lumen_dq.generate --output-dir data/baseline
+
+      - name: DQ checks (strict)
+        run: python -m lumen_dq.run_checks --data-dir data/baseline --strict
+
+      - name: Validate accounts contract
+        run: |
+          python -m lumen_dq.validate_contract contracts/accounts.yml \
+            --data-dir data/baseline
+
+      - name: Run pytest
+        run: pytest tests/ -v --tb=short --junitxml=evidence/junit.xml
+
+      # ── Record promotion evidence ───────────────────────────────────────────
+      - name: Record promotion evidence
+        run: python scripts/record_evidence.py
+
+      # ── Upload staging artifact ─────────────────────────────────────────────
+      - name: Upload staging artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-${{ github.sha }}
+          path: |
+            data/baseline/
+            evidence/
+          retention-days: 90

@@ -1,0 +1,95 @@
+# Data contract: accounts table
+#
+# Executable validation:
+#   python -m lumen_dq.validate_contract contracts/accounts.yml
+#   make validate
+#
+# Version history
+#   1.1  2024-01-30  Updated to schema v2 (product_type, account_status, currency,
+#                    closed_date, ingested_at)
+#   1.0  2024-01-30  Initial contract (post-incident)
+
+table: accounts
+version: "1.1"
+description: >
+  One row per account_id.  Each account belongs to exactly one customer
+  and exactly one branch.  Grain must be enforced before any downstream join.
+
+grain:
+  - account_id
+
+columns:
+  - name: account_id
+    type: VARCHAR
+    nullable: false
+    description: Surrogate PK, format ACCT-NNNN.
+
+  - name: customer_id
+    type: VARCHAR
+    nullable: false
+    description: FK to customers.customer_id.
+
+  - name: branch_id
+    type: INTEGER
+    nullable: false
+    description: FK to branch_reference.branch_id.
+
+  - name: product_type
+    type: VARCHAR
+    nullable: false
+    allowed_values:
+      - CHECKING
+      - SAVINGS
+      - CD
+      - MONEY_MARKET
+    description: Account product type.
+
+  - name: account_status
+    type: VARCHAR
+    nullable: false
+    allowed_values:
+      - ACTIVE
+      - FROZEN
+      - CLOSED
+    description: Lifecycle status.
+
+  - name: currency
+    type: VARCHAR
+    nullable: false
+    allowed_values:
+      - USD
+    description: ISO-4217 currency code; always USD for this bank.
+
+  - name: opened_date
+    type: DATE
+    nullable: false
+    description: Calendar date the account was opened (UTC).
+
+  - name: closed_date
+    type: DATE
+    nullable: true
+    description: >
+      Populated only when account_status = CLOSED.
+      Must be after opened_date.
+
+  - name: ingested_at
+    type: TIMESTAMP
+    nullable: false
+    description: >
+      UTC timestamp when this accounts file was ingested.
+      Freshness SLA: must be within 24 h of the as-of date.
+
+foreign_keys:
+  - column: customer_id
+    references:
+      table: customers
+      column: customer_id
+
+  - column: branch_id
+    references:
+      table: branch_reference
+      column: branch_id
+
+row_counts:
+  min: 1
+  max: 100_000
