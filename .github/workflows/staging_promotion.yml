@@ -35,7 +35,7 @@ jobs:
       # (Promotion must not rely solely on the PR gate passing;
       #  re-run here to guarantee the artifact that is promoted is clean.)
       - name: Generate baseline data
-        run: python -m lumen_dq.generate --output-dir data/baseline
+        run: python -m lumen_dq.generate --output-dir data
 
       - name: DQ checks (strict)
         run: python -m lumen_dq.run_checks --data-dir data/baseline --strict

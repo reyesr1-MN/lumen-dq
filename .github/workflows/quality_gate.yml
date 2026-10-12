@@ -31,8 +31,9 @@ jobs:
           pip install -e .
 
       # ── Data generation ─────────────────────────────────────────────────────
+      # generate CLI writes to {output-dir}/baseline/ so pass the parent "data"
       - name: Generate baseline data (seed=42, deterministic)
-        run: python -m lumen_dq.generate --output-dir data/baseline
+        run: python -m lumen_dq.generate --output-dir data
 
       # ── Layer 1-4 DQ checks ─────────────────────────────────────────────────
       - name: Run layered DQ checks (must pass)
