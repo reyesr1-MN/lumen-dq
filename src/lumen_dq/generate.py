@@ -126,12 +126,7 @@ def _gen_branches() -> pd.DataFrame:
             }
         )
     df = pd.DataFrame(rows)
-    # BUG: inject 5 duplicate branch_id rows to break the grain uniqueness
-    # contract.  Duplicated IDs: 1, 5, 12, 23, 37.  This simulates a
-    # deduplication failure in the branch reference extract.
-    dupes = df[df["branch_id"].isin([1, 5, 12, 23, 37])].copy()
-    dupes["branch_name"] = dupes["branch_name"] + " (DUPLICATE)"
-    df = pd.concat([df, dupes], ignore_index=True)
+    assert df["branch_id"].nunique() == N_BRANCHES
     return df
 
 
