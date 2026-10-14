@@ -227,8 +227,7 @@ def _gen_accounts(
         )
         return {
             "account_id": f"ACCT-{acct_num:04d}",
-            # BUG: customer_id intentionally omitted to break the contract.
-            # This simulates an upstream producer dropping a required column.
+            "customer_id": cid,
             "branch_id": int(bid),
             "product_type": PRODUCT_TYPES[type_i],
             "account_status": status_val,
